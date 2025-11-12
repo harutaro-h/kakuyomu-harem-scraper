@@ -1,3 +1,4 @@
+# .github/workflows/scrape.yml
 name: Kakuyomu Harem Scraper
 
 on:
@@ -19,6 +20,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Google Chrome
+        id: chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
@@ -29,13 +31,15 @@ jobs:
 
       - name: Run scraper
         env:
-          # Selenium が Chrome を自動検出できない環境向けフォールバック
           CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
         run: |
           python kakuyomu_harem_scraper.py
 
-      - name: Upload CSV
+      - name: Upload artifacts (CSV & logs)
         uses: actions/upload-artifact@v4
         with:
-          name: kakuyomu_harem_filtered
-          path: kakuyomu_harem_filtered.csv
+          name: kakuyomu_harem_run
+          path: |
+            kakuyomu_harem_filtered.csv
+            artifacts/**
+          if-no-files-found: warn   # ← CSVがなくても警告に留める
