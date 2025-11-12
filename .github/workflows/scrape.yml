@@ -36,9 +36,11 @@ jobs:
 
       - name: Upload artifacts (CSV & logs)
         uses: actions/upload-artifact@v4
-        with:
-          name: kakuyomu_harem_run
-          path: |
-            ${{ github.workspace }}/kakuyomu_harem_filtered.csv
-            ${{ github.workspace }}/artifacts/**
-          if-no-files-found: warn
+with:
+  name: kakuyomu_harem_run
+  path: |
+    ${{ github.workspace }}/kakuyomu_harem_all.csv
+    ${{ github.workspace }}/kakuyomu_harem_filtered.csv
+    ${{ github.workspace }}/artifacts/**
+  if-no-files-found: warn
+
