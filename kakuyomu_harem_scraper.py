@@ -1,120 +1,132 @@
 # kakuyomu_harem_scraper.py
 # -*- coding: utf-8 -*-
-"""
-Kakuyomu「ハーレム」タグ作品一覧を評価順で走査し、
-条件（初回公開日 >= 2025/04/01、★ >=3000、性描写あり、文字数 >=50,000）で絞り込み、
-結果をCSVで保存する。
-"""
-
-import time
-import re
-import csv
+import os, time, re, csv
 from datetime import datetime
+from tenacity import retry, stop_after_attempt, wait_fixed
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
 
-# ---------- 設定 ----------
 BASE_URL = "https://kakuyomu.jp/tags/ハーレム?sort=popular"
 OUTPUT_CSV = "kakuyomu_harem_filtered.csv"
 MIN_STARS = 3000
 MIN_CHARS = 50000
 MIN_DATE = datetime(2025, 4, 1)
-# --------------------------
 
 def get_driver():
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    driver = webdriver.Chrome(options=options)
-    return driver
+    opts = Options()
+    # CIで安定するフラグ群
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1366,768")
+    ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+    opts.add_argument(f"--user-agent={ua}")
+    # 必要時のみ CHROME_PATH を使う
+    chrome_path = os.environ.get("CHROME_PATH") or os.environ.get("CHROME_BIN")
+    if chrome_path:
+        opts.binary_location = chrome_path
+    return webdriver.Chrome(options=opts)
 
-def scroll_to_bottom(driver, pause_time=2, max_scrolls=50):
-    """無限スクロールを★3000未満になるまで or max_scrolls回"""
-    last_height = driver.execute_script("return document.body.scrollHeight")
-    for i in range(max_scrolls):
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(pause_time)
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
-            break
-        last_height = new_height
+def parse_number(s):
+    m = re.sub(r"[^\d]", "", s or "")
+    return int(m) if m.isdigit() else 0
 
-def parse_number(text):
-    return int(re.sub(r"[^\d]", "", text))
+def extract_first_date_from_toc(html: str):
+    soup = BeautifulSoup(html, "lxml")
+    times = [t.get("datetime", "")[:10] for t in soup.select("time[datetime]")]
+    dates = []
+    for d in times:
+        try:
+            dates.append(datetime.fromisoformat(d))
+        except Exception:
+            pass
+    return min(dates) if dates else None
 
-def get_first_episode_date(soup):
-    # 目次内から「YYYY年MM月DD日 公開」を取得
-    date_tag = soup.find("time", {"datetime": True})
-    if date_tag and date_tag.get("datetime"):
-        return datetime.fromisoformat(date_tag["datetime"].split("T")[0])
-    return None
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def get_html(driver, url):
+    driver.get(url)
+    time.sleep(1.5)
+    return driver.page_source
 
 def main():
     driver = get_driver()
-    print("アクセス中:", BASE_URL)
+    print("Open:", BASE_URL)
     driver.get(BASE_URL)
-    scroll_to_bottom(driver)
 
-    soup = BeautifulSoup(driver.page_source, "html.parser")
+    # ある程度スクロール（タグ人気順の無限ロードを想定）
+    last = 0
+    for _ in range(30):
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(1.2)
+        h = driver.execute_script("return document.body.scrollHeight;")
+        if h == last:
+            break
+        last = h
+
+    soup = BeautifulSoup(driver.page_source, "lxml")
     cards = soup.select("div.widget-workCard")
+    print("cards:", len(cards))
 
-    results = []
-    print(f"{len(cards)}件の作品カードを検出しました。")
-
-    for card in cards:
-        title_tag = card.select_one("h3.widget-workCard-title a")
-        if not title_tag:
+    rows = []
+    for i, card in enumerate(cards, 1):
+        a = card.select_one("h3.widget-workCard-title a")
+        if not a: 
             continue
-        title = title_tag.text.strip()
-        url = "https://kakuyomu.jp" + title_tag["href"]
-        stars_tag = card.select_one("span.widget-workCard-reviewCount")
-        stars = parse_number(stars_tag.text) if stars_tag else 0
-        tags_text = " ".join(t.text for t in card.select(".widget-workCard-tag"))
-        has_harem_tag = "ハーレム" in tags_text
-        char_tag = card.select_one("span.widget-workCard-charCount")
-        total_chars = parse_number(char_tag.text) if char_tag else 0
+        title = a.get_text(strip=True)
+        work_url = "https://kakuyomu.jp" + a["href"]
 
-        # 各作品ページへ遷移して詳細確認
-        driver.get(url)
-        time.sleep(1.5)
-        soup_detail = BeautifulSoup(driver.page_source, "html.parser")
+        stars = parse_number((card.select_one("span.widget-workCard-reviewCount") or {}).get_text() if card.select_one("span.widget-workCard-reviewCount") else "")
+        tags_text = " ".join(t.get_text(strip=True) for t in card.select(".widget-workCard-tag"))
+        has_harem = "ハーレム" in tags_text
+        total_chars = parse_number((card.select_one("span.widget-workCard-charCount") or {}).get_text() if card.select_one("span.widget-workCard-charCount") else "")
 
-        notice = "性描写あり" in soup_detail.text
-        date = get_first_episode_date(soup_detail)
+        # 作品トップで注意書きと目次の初回日を確定
+        html = get_html(driver, work_url)
+        soup_detail = BeautifulSoup(html, "lxml")
+        notice = ("性描写あり" in soup_detail.get_text(" ", strip=True))
 
-        meets_all = (
-            stars >= MIN_STARS and
-            notice and
-            has_harem_tag and
-            total_chars >= MIN_CHARS and
-            date and date >= MIN_DATE
-        )
+        # 目次URL（作品トップと同一ページ内にある場合もあるが、念のため /episodes にも対応）
+        toc_url = work_url + "/episodes" if not work_url.endswith("/episodes") else work_url
+        toc_html = get_html(driver, toc_url)
+        first_date = extract_first_date_from_toc(toc_html)
 
-        results.append({
+        meets = all([
+            has_harem,
+            notice,
+            stars >= MIN_STARS,
+            total_chars >= MIN_CHARS,
+            (first_date and first_date >= MIN_DATE)
+        ])
+
+        rows.append({
             "title": title,
-            "url": url,
+            "url": work_url,
             "stars": stars,
             "total_chars": total_chars,
             "notice_sexual": notice,
-            "first_episode_date": date.strftime("%Y-%m-%d") if date else "",
+            "first_episode_date": first_date.strftime("%Y-%m-%d") if first_date else "",
             "tags": tags_text,
-            "meets_conditions": meets_all
+            "meets_conditions": meets
         })
-        print(f"→ {title} [{stars}★ / {total_chars}字 / {date}]")
+        print(f"[{i}] {title}  ★{stars}  {total_chars}字  first={first_date}  ok={meets}")
+
+        # ★が3000未満のカードが増えてきたら早期終了（任意）
+        # if stars < MIN_STARS: break
 
     driver.quit()
 
-    # CSV保存
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=results[0].keys())
-        writer.writeheader()
-        writer.writerows(results)
-
-    print(f"\n✅ CSV出力完了: {OUTPUT_CSV}")
-    filtered = [r for r in results if r["meets_conditions"]]
-    print(f"条件一致作品: {len(filtered)}件")
+    if rows:
+        with open(OUTPUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
+            import csv
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        print("Saved:", OUTPUT_CSV)
+    else:
+        print("No rows scraped.")
 
 if __name__ == "__main__":
     main()
+
