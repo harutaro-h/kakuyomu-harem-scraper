@@ -1,4 +1,3 @@
-# .github/workflows/scrape.yml
 name: Kakuyomu Harem Scraper
 
 on:
@@ -42,4 +41,4 @@ jobs:
           path: |
             kakuyomu_harem_filtered.csv
             artifacts/**
-          if-no-files-found: warn   # ← CSVがなくても警告に留める
+          if-no-files-found: warn
