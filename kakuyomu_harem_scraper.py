@@ -1,50 +1,50 @@
 # kakuyomu_harem_scraper.py
 # -*- coding: utf-8 -*-
 """
-Kakuyomu「ハーレム」タグを人気順で無限スクロール巡回し、
-各作品の ★数 / 文字数 / 注意書き(性描写あり) / 初回公開日 / タグ を取得。
-下記条件で AND フィルタし、CSV を必ず出力（0件でもヘッダ付き）。
-- 初回公開日 >= 2025-04-01
-- ★ >= 3000
-- 性描写あり
-- 文字数 >= 50,000
-- タグに「ハーレム」を含む（複合タグ内も可）
+Kakuyomu タグ「ハーレム」を人気順でページ送り (?page=2,3,...) しながら全巡回。
+各作品について:
+- ★数
+- 総文字数
+- 注意書き「性描写あり」
+- 初回公開日（目次の最古 <time datetime>）
+- タグ（一覧/詳細の両方）
+を取得し、以下の AND 条件でフィルタした結果を CSV に出力（0件でもヘッダ付き）:
 
-加えて、デバッグ用の証跡（HTML・スクリーンショット・不整合一覧）を artifacts/ に保存。
+  初回公開日 >= 2025-04-01
+  ★ >= 3000
+  「性描写あり」
+  文字数 >= 50000
+  タグに「ハーレム」を含む（複合タグも可）
+
+さらに artifacts/ に HTML・スクショ・不整合候補を保存（Actions の Artifacts でDL可）。
 """
 
-import os
-import re
-import csv
-import time
+import os, re, csv, time
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Tuple, List
+from typing import Optional, List
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 # ===== 設定 =====
-BASE_URL = "https://kakuyomu.jp/tags/ハーレム?sort=popular"  # 人気順
+BASE_URL = "https://kakuyomu.jp/tags/ハーレム?sort=popular"
 OUT_CSV = "kakuyomu_harem_filtered.csv"
-MISMATCH_CSV = "artifacts/mismatch.csv"
-ARTIFACT_DIR = Path("artifacts")
-ARTIFACT_DIR.mkdir(exist_ok=True)
+ARTIFACT_DIR = Path("artifacts"); ARTIFACT_DIR.mkdir(exist_ok=True)
+MISMATCH_CSV = ARTIFACT_DIR / "mismatch.csv"
 
 MIN_STARS = 3000
 MIN_CHARS = 50000
 MIN_DATE = datetime(2025, 4, 1)
-MAX_SCROLLS = 60                 # 無限スクロール上限
-SCROLL_PAUSE = 1.0               # スクロール間待機
-EXTRA_SETTLE_WAIT = 2.0          # 終端での余韻待機
 
-# ===============
+MAX_PAGES = 50          # 安全上限（必要に応じて増やす）
+PAGE_SLEEP = 1.0        # ページ間の待機
+DETAIL_SLEEP = 0.8      # 作品詳細取得の待機
+# =================
 
 
 def get_driver():
@@ -56,241 +56,189 @@ def get_driver():
     opts.add_argument("--window-size=1366,768")
     ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
     opts.add_argument(f"--user-agent={ua}")
-    # GitHub Actions の setup-chrome 用フォールバック
     chrome_path = os.environ.get("CHROME_PATH") or os.environ.get("CHROME_BIN")
     if chrome_path:
         opts.binary_location = chrome_path
     return webdriver.Chrome(options=opts)
 
+def build_page_url(base: str, page: int) -> str:
+    """BASE_URL に page パラメータを付加/上書き"""
+    u = urlsplit(base)
+    q = dict(parse_qsl(u.query))
+    q["page"] = str(page)
+    new_q = urlencode(q, doseq=True)
+    return urlunsplit((u.scheme, u.netloc, u.path, new_q, u.fragment))
 
 def parse_number(s: Optional[str]) -> Optional[int]:
-    if not s:
-        return None
+    if not s: return None
     m = re.sub(r"[^\d]", "", s)
     return int(m) if m.isdigit() else None
 
-
-def extract_first_date_from_toc(html: str) -> Optional[datetime]:
+def pick_first_date_from_html(html: str) -> Optional[datetime]:
     soup = BeautifulSoup(html, "lxml")
     times = [t.get("datetime", "")[:10] for t in soup.select("time[datetime]")]
     dates: List[datetime] = []
     for d in times:
-        try:
-            dates.append(datetime.fromisoformat(d))
-        except Exception:
-            pass
+        try: dates.append(datetime.fromisoformat(d))
+        except: pass
     return min(dates) if dates else None
 
-
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def get_html(driver, url: str) -> str:
+def fetch_html(driver, url: str) -> str:
     driver.get(url)
-    # 描画完了待ち
-    WebDriverWait(driver, 15).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
-    )
-    time.sleep(1.0)
+    time.sleep(DETAIL_SLEEP)
     return driver.page_source
 
-
-def save_artifact(driver, name: str):
-    # 画面とHTMLを保存
-    driver.save_screenshot(str(ARTIFACT_DIR / f"{name}.png"))
-    (ARTIFACT_DIR / f"{name}.html").write_text(driver.page_source, encoding="utf-8")
-
-
-def find_cards_html(html: str):
-    """複数パターンで一覧カードを拾う（将来のDOM変更に備える）"""
+def card_select_all(html: str):
     soup = BeautifulSoup(html, "lxml")
     cards = soup.select("div.widget-workCard")
     if not cards:
-        # 代替（タイトルリンクからカード要素を逆引き）
         cards = [a.parent for a in soup.select("h3 a[href^='/works/']")]
-    return cards, soup
+    return soup, cards
 
+def card_title_and_url(card) -> Optional[tuple]:
+    a = card.select_one("h3 a[href^='/works/']") or card.select_one("a[href^='/works/']")
+    if not a: return None
+    return a.get_text(strip=True), "https://kakuyomu.jp" + a["href"]
 
-def pick_star(card) -> Optional[int]:
-    for sel in [
-        "span.widget-workCard-reviewCount",
-        "span.reviewCount",
-        "[data-testid='review-count']",
-    ]:
+def card_stars(card) -> Optional[int]:
+    for sel in ["span.widget-workCard-reviewCount", "span.reviewCount", "[data-testid='review-count']"]:
         el = card.select_one(sel)
         if el and el.get_text(strip=True):
             return parse_number(el.get_text(strip=True))
     return None
 
-
-def pick_chars(card) -> Optional[int]:
-    for sel in [
-        "span.widget-workCard-charCount",
-        "span.charCount",
-        "[data-testid='char-count']",
-    ]:
+def card_chars(card) -> Optional[int]:
+    for sel in ["span.widget-workCard-charCount", "span.charCount", "[data-testid='char-count']"]:
         el = card.select_one(sel)
         if el and el.get_text(strip=True):
             return parse_number(el.get_text(strip=True))
     return None
 
-
-def pick_tags(container) -> str:
-    tags_texts = []
+def collect_tags(container) -> str:
+    tags = []
     for sel in [".widget-workCard-tag", ".tag", "[data-testid='tag']"]:
         for t in container.select(sel):
             s = t.get_text(strip=True)
-            if s:
-                tags_texts.append(s)
-    return " ".join(tags_texts)
+            if s: tags.append(s)
+    return " ".join(tags)
 
-
-def detect_sexual_notice(soup_detail: BeautifulSoup) -> bool:
-    # まずは注意書きっぽい領域を優先
+def detect_sexual_notice(detail_soup: BeautifulSoup) -> bool:
     for sel in [".workHeader-notice", ".notice", "[data-testid='notice']"]:
-        bloc = soup_detail.select(sel)
+        bloc = detail_soup.select(sel)
         if bloc:
             text = " ".join(el.get_text(" ", strip=True) for el in bloc)
-            if "性描写あり" in text:
-                return True
-    # フォールバック：全文
-    return "性描写あり" in soup_detail.get_text(" ", strip=True)
+            if "性描写あり" in text: return True
+    return "性描写あり" in detail_soup.get_text(" ", strip=True)
 
+def detail_fallbacks_if_missing(stars, chars, detail_soup):
+    """一覧で欠損した場合、詳細ページ側でも拾えるものを拾う（強化用・必要最低限）"""
+    # 星は詳細ページで露出が弱い場合もあるので、そのまま None を許容
+    # 文字数は詳細ページに合計が出ることが多い
+    if chars is None:
+        for sel in ["span.charCount", "[data-testid='char-count']"]:
+            el = detail_soup.select_one(sel)
+            if el and el.get_text(strip=True):
+                chars = parse_number(el.get_text(strip=True))
+                break
+    return stars, chars
 
 def main():
     driver = get_driver()
-    print("Open:", BASE_URL)
-    driver.get(BASE_URL)
+    all_rows = []
+    mismatch_rows = []
 
-    # 初期ロード待ち & 証跡
-    WebDriverWait(driver, 15).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "body"))
-    )
-    save_artifact(driver, "1_initial")
+    for page in range(1, MAX_PAGES + 1):
+        page_url = build_page_url(BASE_URL, page)
+        html = fetch_html(driver, page_url)
+        (ARTIFACT_DIR / f"page_{page}.html").write_text(html, encoding="utf-8")
+        driver.save_screenshot(str(ARTIFACT_DIR / f"page_{page}.png"))
+        soup, cards = card_select_all(html)
 
-    # 一覧のカードが出るまで待つ
-    try:
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "div.widget-workCard, h3 a[href^='/works/']")
+        if not cards:
+            print(f"page {page}: no cards -> stop")
+            break
+
+        print(f"page {page}: cards={len(cards)}")
+
+        # 各カード処理
+        low_star_tail = 0
+        for i, card in enumerate(cards, 1):
+            tit_url = card_title_and_url(card)
+            if not tit_url: continue
+            title, work_url = tit_url
+
+            stars = card_stars(card)
+            chars = card_chars(card)
+            tags_list = collect_tags(card)
+            has_harem = "ハーレム" in (tags_list or "")
+
+            # 作品詳細
+            detail_html = fetch_html(driver, work_url)
+            detail_soup = BeautifulSoup(detail_html, "lxml")
+            notice = detect_sexual_notice(detail_soup)
+            # 目次（/episodes 存在しない場合はトップの <time> 群で代用）
+            episodes_url = work_url + "/episodes"
+            try:
+                toc_html = fetch_html(driver, episodes_url)
+            except Exception:
+                toc_html = detail_html
+            first_date = pick_first_date_from_html(toc_html)
+
+            # 欠損フォールバック
+            stars, chars = detail_fallbacks_if_missing(stars, chars, detail_soup)
+            tags_detail = collect_tags(detail_soup)
+
+            # 厳密判定（欠損は False）
+            meets = (
+                isinstance(stars, int) and stars >= MIN_STARS and
+                isinstance(chars, int) and chars >= MIN_CHARS and
+                bool(notice) and bool(has_harem) and
+                (first_date is not None and first_date >= MIN_DATE)
             )
-        )
-    except Exception:
-        print("WARN: 初期カード検出に失敗")
-    # 無限スクロール
-    last_h = 0
-    same_cnt = 0
-    for _ in range(MAX_SCROLLS):
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(SCROLL_PAUSE)
-        h = driver.execute_script("return document.body.scrollHeight;")
-        if h == last_h:
-            same_cnt += 1
-            if same_cnt >= 3:
-                break
-        else:
-            same_cnt = 0
-            last_h = h
 
-    time.sleep(EXTRA_SETTLE_WAIT)  # 終端の余韻待ち
-    save_artifact(driver, "2_after_scroll")
-
-    cards, soup = find_cards_html(driver.page_source)
-    print(f"cards detected: {len(cards)}")
-
-    rows = []
-    mismatches = []
-
-    for i, card in enumerate(cards, 1):
-        a = card.select_one("h3 a[href^='/works/']") or card.select_one("a[href^='/works/']")
-        if not a:
-            continue
-        title = a.get_text(strip=True)
-        work_url = "https://kakuyomu.jp" + a["href"]
-
-        stars = pick_star(card)
-        total_chars = pick_chars(card)
-        tags_text = pick_tags(card)
-        has_harem = "ハーレム" in (tags_text or "")
-
-        # 作品トップ → 注意書き
-        html_detail = get_html(driver, work_url)
-        soup_detail = BeautifulSoup(html_detail, "lxml")
-        notice = detect_sexual_notice(soup_detail)
-
-        # 目次（/episodes が無い場合はトップの <time> 群で代用）
-        toc_url = work_url + "/episodes"
-        try:
-            html_toc = get_html(driver, toc_url)
-        except Exception:
-            html_toc = html_detail
-        first_date = extract_first_date_from_toc(html_toc)
-
-        # 厳密判定（欠損は即 False）
-        meets = (
-            isinstance(stars, int) and stars >= MIN_STARS and
-            isinstance(total_chars, int) and total_chars >= MIN_CHARS and
-            bool(notice) and bool(has_harem) and
-            (first_date is not None and first_date >= MIN_DATE)
-        )
-
-        # 作品トップ側のタグでも補助確認（安全網）
-        # ※ false positive を避けるため meets 計算は上の has_harem のみで実施
-        tags_detail = pick_tags(soup_detail)
-        # ログ
-        print(f"[{i}] {title} ★{stars}  {total_chars}字  first={first_date}  sex={notice}  tagOK={has_harem}  meets={meets}")
-
-        rows.append({
-            "title": title,
-            "url": work_url,
-            "stars": stars if stars is not None else "",
-            "total_chars": total_chars if total_chars is not None else "",
-            "notice_sexual": notice,
-            "first_episode_date": first_date.strftime("%Y-%m-%d") if first_date else "",
-            "tags": tags_text,
-            "tags_detail": tags_detail,
-            "meets_conditions": meets,
-            "raw_review_selector_hit": stars is not None,
-            "raw_chars_selector_hit": total_chars is not None
-        })
-
-        # 再評価ロジックでの期待値とズレたら記録（星/文字/タグ/日付/注意書き）
-        expected = meets
-        # ここでは expected==meets なので、将来 他経路 併設時の差分検出に備えて行だけ残す
-        if stars is None or total_chars is None or not has_harem or not notice or (first_date is None):
-            mismatches.append({
-                "title": title, "url": work_url,
-                "stars": stars, "total_chars": total_chars, "notice_sexual": notice,
+            all_rows.append({
+                "title": title,
+                "url": work_url,
+                "stars": stars if stars is not None else "",
+                "total_chars": chars if chars is not None else "",
+                "notice_sexual": notice,
                 "first_episode_date": first_date.strftime("%Y-%m-%d") if first_date else "",
-                "tags": tags_text, "tags_detail": tags_detail
+                "tags": tags_list,
+                "tags_detail": tags_detail,
+                "meets_conditions": meets
             })
 
-    # まとめ出力（0件でも必ずCSVを作る）
-    headers = ["title","url","stars","total_chars","notice_sexual","first_episode_date","tags","tags_detail","meets_conditions","raw_review_selector_hit","raw_chars_selector_hit"]
-    with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=headers)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
+            # 星の低い領域が続いたら早期打ち切りのヒント（任意）
+            if isinstance(stars, int) and stars < MIN_STARS:
+                low_star_tail += 1
+            else:
+                low_star_tail = 0
 
-    # 不整合っぽい行を別CSVに
-    if mismatches:
-        with open(MISMATCH_CSV, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=list(mismatches[0].keys()))
-            w.writeheader()
-            for r in mismatches:
-                w.writerow(r)
+        # 末尾に★<3000 が大量に続くページが現れたら打ち切る（任意）
+        if low_star_tail >= max(10, len(cards)//2):
+            print(f"page {page}: low-star tail detected -> early stop")
+            break
 
-    # 収集サマリ
-    (ARTIFACT_DIR / "scrape_summary.txt").write_text(
-        f"cards_detected={len(cards)}\nrows={len(rows)}\ncsv={OUT_CSV}\n",
-        encoding="utf-8"
-    )
-
-    print(f"\nSaved CSV: {OUT_CSV} (rows={len(rows)})")
-    if mismatches:
-        print(f"Mismatch rows: {len(mismatches)} -> {MISMATCH_CSV}")
+        time.sleep(PAGE_SLEEP)
 
     driver.quit()
 
+    # CSV（必ず出力）
+    headers = ["title","url","stars","total_chars","notice_sexual","first_episode_date","tags","tags_detail","meets_conditions"]
+    with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=headers); w.writeheader(); w.writerows(all_rows)
 
-if __name__ == "__main__":
-    main()
+    # “疑いあり”だけまとめ（欠損/タグ欠落/日付なし等）
+    for r in all_rows:
+        if (r["stars"] == "" or r["total_chars"] == "" or not r["notice_sexual"] or "ハーレム" not in str(r["tags"]) or r["first_episode_date"] == ""):
+            mismatch_rows.append(r)
+    if mismatch_rows:
+        with open(MISMATCH_CSV, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=headers); w.writeheader(); w.writerows(mismatch_rows)
+
+    # サマリ
+    (ARTIFACT_DIR / "scrape_summary.txt").write_text(
+        f"pages_processed={page}\nrows={len(all_rows)}\n", encoding="utf-8"
+    )
+    print(f"Saved: {OUT_CSV} rows={len(all_rows)}  mismatches={len(mismatch_rows)}")
