@@ -225,20 +225,31 @@ def main():
     driver.quit()
 
     # CSV（必ず出力）
-    headers = ["title","url","stars","total_chars","notice_sexual","first_episode_date","tags","tags_detail","meets_conditions"]
-    with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=headers); w.writeheader(); w.writerows(all_rows)
+headers = ["title","url","stars","total_chars","notice_sexual","first_episode_date","tags","tags_detail","meets_conditions"]
 
-    # “疑いあり”だけまとめ（欠損/タグ欠落/日付なし等）
-    for r in all_rows:
-        if (r["stars"] == "" or r["total_chars"] == "" or not r["notice_sexual"] or "ハーレム" not in str(r["tags"]) or r["first_episode_date"] == ""):
-            mismatch_rows.append(r)
-    if mismatch_rows:
-        with open(MISMATCH_CSV, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=headers); w.writeheader(); w.writerows(mismatch_rows)
+# 👇 追加ここから
+OUT_CSV = Path.cwd() / OUT_CSV
+ARTIFACT_DIR = Path.cwd() / ARTIFACT_DIR
+# 👆 追加ここまで
 
-    # サマリ
-    (ARTIFACT_DIR / "scrape_summary.txt").write_text(
-        f"pages_processed={page}\nrows={len(all_rows)}\n", encoding="utf-8"
-    )
-    print(f"Saved: {OUT_CSV} rows={len(all_rows)}  mismatches={len(mismatch_rows)}")
+with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
+    w = csv.DictWriter(f, fieldnames=headers)
+    w.writeheader()
+    w.writerows(all_rows)
+
+# “疑いあり”だけまとめ（欠損/タグ欠落/日付なし等）
+for r in all_rows:
+    if (r["stars"] == "" or r["total_chars"] == "" or not r["notice_sexual"] or "ハーレム" not in str(r["tags"]) or r["first_episode_date"] == ""):
+        mismatch_rows.append(r)
+if mismatch_rows:
+    with open(ARTIFACT_DIR / "mismatch.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        w.writeheader()
+        w.writerows(mismatch_rows)
+
+# サマリ
+(ARTIFACT_DIR / "scrape_summary.txt").write_text(
+    f"pages_processed={page}\nrows={len(all_rows)}\n", encoding="utf-8"
+)
+print(f"Saved: {OUT_CSV} rows={len(all_rows)} mismatches={len(mismatch_rows)}")
+
