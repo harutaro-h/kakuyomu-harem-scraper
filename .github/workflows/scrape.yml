@@ -39,6 +39,6 @@ jobs:
         with:
           name: kakuyomu_harem_run
           path: |
-            kakuyomu_harem_filtered.csv
-            artifacts/**
+            ${{ github.workspace }}/kakuyomu_harem_filtered.csv
+            ${{ github.workspace }}/artifacts/**
           if-no-files-found: warn
