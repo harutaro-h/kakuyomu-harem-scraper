@@ -21,7 +21,17 @@ MISMATCH_CSV_NAME  = "mismatch.csv"
 
 MIN_STARS = 3000
 MIN_CHARS = 50000
-MIN_DATE  = datetime(2025, 4, 1)
+# 最低公開日。環境変数 KAKUYOMU_MIN_DATE (YYYY-MM-DD) で上書きできる。
+# 直近作品も拾いたい場合は 2020-01-01 等の過去日付に調整する。
+_MIN_DATE_ENV_VAR = "KAKUYOMU_MIN_DATE"
+_DEFAULT_MIN_DATE = "2018-01-01"
+_min_date_raw = os.environ.get(_MIN_DATE_ENV_VAR, _DEFAULT_MIN_DATE)
+try:
+    MIN_DATE = datetime.fromisoformat(_min_date_raw)
+except ValueError:
+    raise ValueError(
+        f"Invalid date for {_MIN_DATE_ENV_VAR}: '{_min_date_raw}'. Use YYYY-MM-DD format."
+    )
 
 MAX_PAGES      = 80   # 一覧側の上限（必要なら増やす）
 PAGE_SLEEP     = 1.0
