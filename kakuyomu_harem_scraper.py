@@ -1,327 +1,343 @@
-# kakuyomu_harem_scraper.py
-# -*- coding: utf-8 -*-
-import os, re, csv, time
-from pathlib import Path
+#!/usr/bin/env python3
+"""Kakuyomu harem tag scraper.
+
+This script enumerates Kakuyomu works tagged with "ハーレム" and filters them by:
+- first episode posted on or after 2025-04-01
+- review star (point) count of at least 3,000
+- total character count of at least 50,000
+
+The results are written to ``kakuyomu_harem_filtered.csv`` in UTF-8 with BOM so the
+file can be opened in spreadsheet software without mojibake.
+"""
+
+from __future__ import annotations
+
+import csv
+import re
+import time
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, List, Tuple
-from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl, urljoin
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
-from bs4 import BeautifulSoup
-from tenacity import retry, stop_after_attempt, wait_fixed
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+import requests
+from bs4 import BeautifulSoup, Tag
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ===== 設定 =====
-BASE_URL = "https://kakuyomu.jp/tags/ハーレム?sort=popular"
+BASE_URL = "https://kakuyomu.jp/tags/ハーレム"
+MIN_START_DATE = datetime(2025, 4, 1)
+MIN_STAR_COUNT = 3000
+MIN_CHARACTER_COUNT = 50_000
+REQUEST_DELAY_SECONDS = 1.0
+LISTING_MAX_PAGES = 200
+OUTPUT_CSV = Path("kakuyomu_harem_filtered.csv")
 
-ALL_CSV_NAME       = "kakuyomu_harem_all.csv"        # 全件（監査用）
-FILTERED_CSV_NAME  = "kakuyomu_harem_filtered.csv"   # 条件一致のみ（これが最終成果物）
-ARTIFACT_DIR_NAME  = "artifacts"
-MISMATCH_CSV_NAME  = "mismatch.csv"
+LISTING_CARD_SELECTOR = "div.widget-workCard"
+CARD_LINK_SELECTOR = "h3 a[href^='/works/'], a[href^='/works/']"
+CARD_TAG_SELECTORS = (
+    ".widget-workCard-tag",
+    ".tag",
+    "[data-testid='tag']",
+)
+STAR_SELECTORS = (
+    "span.widget-workCard-reviewPoints",
+    "span.widget-workCard-reviewPoint",
+    "span.widget-workCard-reviewCount",
+    "span.reviewPoints",
+    "span.reviewPoint",
+    "span.reviewCount",
+    "[data-testid='review-point']",
+    "[data-testid='review-count']",
+)
+CHAR_COUNT_SELECTORS = (
+    "span.widget-workCard-charCount",
+    "span.charCount",
+    "[data-testid='char-count']",
+)
+DETAIL_STAR_SELECTORS = (
+    "span.widget-workHeader-reviewPoints",
+    "span.widget-workHeader-reviewPoint",
+    "span.reviewPoints",
+    "span.reviewPoint",
+    "span.reviewCount",
+    "[data-testid='review-point']",
+    "[data-testid='review-count']",
+)
+DETAIL_CHAR_SELECTORS = (
+    "span.widget-workHeader-charCount",
+    "span.widget-workInfo-charCount",
+    "span.charCount",
+    "[data-testid='char-count']",
+)
+DETAIL_TAG_SELECTORS = (
+    "[data-testid='tag']",
+    ".widget-workTag-item",
+    ".work-tag",
+    ".tag",
+)
+TEXTUAL_CHAR_LABELS = ("総文字数", "文字数")
 
-MIN_STARS = 3000
-MIN_CHARS = 50000
-# 最低公開日。環境変数 KAKUYOMU_MIN_DATE (YYYY-MM-DD) で上書きできる。
-# 直近作品も拾いたい場合は 2020-01-01 等の過去日付に調整する。
-_MIN_DATE_ENV_VAR = "KAKUYOMU_MIN_DATE"
-# デフォルトでは、2025年以降に公開された作品のみを対象にする。
-_DEFAULT_MIN_DATE = "2025-01-01"
-_min_date_raw = os.environ.get(_MIN_DATE_ENV_VAR, _DEFAULT_MIN_DATE)
-try:
-    MIN_DATE = datetime.fromisoformat(_min_date_raw)
-except ValueError:
-    raise ValueError(
-        f"Invalid date for {_MIN_DATE_ENV_VAR}: '{_min_date_raw}'. Use YYYY-MM-DD format."
-    )
-
-MAX_PAGES      = 80   # 一覧側の上限（必要なら増やす）
-PAGE_SLEEP     = 1.0
-DETAIL_SLEEP   = 0.8
-EPAGE_SLEEP    = 0.6  # 目次ページ間の待機
-# =================
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
-# ---------- 共通ユーティリティ ----------
-def get_driver():
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1366,768")
-    ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
-    opts.add_argument(f"--user-agent={ua}")
-    chrome_path = os.environ.get("CHROME_PATH") or os.environ.get("CHROME_BIN")
-    if chrome_path:
-        opts.binary_location = chrome_path
-    return webdriver.Chrome(options=opts)
+@dataclass
+class WorkRecord:
+    """Represents a Kakuyomu work and the data required for filtering."""
 
-def build_page_url(base: str, page: int) -> str:
-    u = urlsplit(base)
-    q = dict(parse_qsl(u.query))
-    q["page"] = str(page)
-    new_q = urlencode(q, doseq=True)
-    return urlunsplit((u.scheme, u.netloc, u.path, new_q, u.fragment))
+    title: str
+    url: str
+    stars: Optional[int]
+    total_chars: Optional[int]
+    first_episode_date: Optional[datetime]
+    tags: Sequence[str]
 
-def parse_number(s: Optional[str]) -> Optional[int]:
-    if not s: return None
-    m = re.sub(r"[^\d]", "", s)
-    return int(m) if m.isdigit() else None
+    def meets_requirements(self) -> bool:
+        return (
+            isinstance(self.stars, int)
+            and self.stars >= MIN_STAR_COUNT
+            and isinstance(self.total_chars, int)
+            and self.total_chars >= MIN_CHARACTER_COUNT
+            and isinstance(self.first_episode_date, datetime)
+            and self.first_episode_date >= MIN_START_DATE
+            and any(tag == "ハーレム" for tag in self.tags)
+        )
 
-def collect_tags(container: BeautifulSoup) -> str:
-    tags = []
-    for sel in [".widget-workCard-tag", ".tag", "[data-testid='tag']"]:
-        for t in container.select(sel):
-            s = t.get_text(strip=True)
-            if s: tags.append(s)
-    return " ".join(tags)
+    def as_csv_row(self) -> List[str]:
+        return [
+            self.title,
+            self.url,
+            str(self.stars or ""),
+            str(self.total_chars or ""),
+            self.first_episode_date.strftime("%Y-%m-%d") if self.first_episode_date else "",
+            " ".join(self.tags),
+        ]
 
-def detect_sexual_notice(detail_soup: BeautifulSoup) -> bool:
-    for sel in [".workHeader-notice", ".notice", "[data-testid='notice']"]:
-        bloc = detail_soup.select(sel)
-        if bloc:
-            text = " ".join(el.get_text(" ", strip=True) for el in bloc)
-            if "性描写あり" in text:
-                return True
-    return "性描写あり" in detail_soup.get_text(" ", strip=True)
 
-def pick_first_date_from_html(html: str) -> List[datetime]:
+class KakuyomuClient:
+    """HTTP client with retry and polite throttling."""
+
+    def __init__(self, delay_seconds: float = REQUEST_DELAY_SECONDS) -> None:
+        self.session = requests.Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self.session.headers["User-Agent"] = USER_AGENT
+        self.delay_seconds = delay_seconds
+
+    def fetch_html(self, url: str) -> str:
+        response = self.session.get(url, timeout=20)
+        response.raise_for_status()
+        if self.delay_seconds:
+            time.sleep(self.delay_seconds)
+        return response.text
+
+
+def build_listing_url(page: int) -> str:
+    """Return the harem tag listing URL for a specific page."""
+
+    base_parts = urlsplit(BASE_URL)
+    query = dict(parse_qsl(base_parts.query))
+    query.setdefault("sort", "popular")
+    query["page"] = str(page)
+    new_query = urlencode(query, doseq=True)
+    return urlunsplit((base_parts.scheme, base_parts.netloc, base_parts.path, new_query, base_parts.fragment))
+
+
+def clean_number(text: str) -> Optional[int]:
+    if not text:
+        return None
+    digits = re.sub(r"[^0-9]", "", text)
+    return int(digits) if digits else None
+
+
+def collect_texts(container: BeautifulSoup | Tag, selectors: Sequence[str]) -> List[str]:
+    values: List[str] = []
+    for selector in selectors:
+        for element in container.select(selector):
+            text = element.get_text(strip=True)
+            if text:
+                values.append(text)
+    return values
+
+
+def extract_number_from_selectors(container: BeautifulSoup | Tag, selectors: Sequence[str]) -> Optional[int]:
+    for selector in selectors:
+        element = container.select_one(selector)
+        if element:
+            number = clean_number(element.get_text(strip=True))
+            if number is not None:
+                return number
+    return None
+
+
+def extract_tags(container: BeautifulSoup | Tag) -> List[str]:
+    tags = collect_texts(container, CARD_TAG_SELECTORS)
+    if not tags:
+        tags = collect_texts(container, DETAIL_TAG_SELECTORS)
+    seen = []
+    for tag in tags:
+        if tag not in seen:
+            seen.append(tag)
+    return seen
+
+
+def extract_characters_from_textual_labels(soup: BeautifulSoup) -> Optional[int]:
+    for label in TEXTUAL_CHAR_LABELS:
+        dt = soup.find("dt", string=lambda value: isinstance(value, str) and label in value)
+        if dt:
+            dd = dt.find_next("dd")
+            if dd:
+                number = clean_number(dd.get_text(strip=True))
+                if number is not None:
+                    return number
+    return None
+
+
+def parse_card(card: Tag) -> Tuple[str, str, Optional[int], Optional[int], List[str]]:
+    link = card.select_one(CARD_LINK_SELECTOR)
+    if not link or not link.get("href"):
+        raise ValueError("Work card missing link")
+    title = link.get_text(strip=True)
+    url = urljoin("https://kakuyomu.jp", link["href"])
+    stars = extract_number_from_selectors(card, STAR_SELECTORS)
+    char_count = extract_number_from_selectors(card, CHAR_COUNT_SELECTORS)
+    tags = extract_tags(card)
+    return title, url, stars, char_count, tags
+
+
+def parse_detail_page(html: str) -> Tuple[Optional[int], Optional[int], List[str]]:
     soup = BeautifulSoup(html, "lxml")
-    dts = []
-    for t in soup.select("time[datetime]"):
-        val = (t.get("datetime") or "")[:10]
+    stars = extract_number_from_selectors(soup, DETAIL_STAR_SELECTORS)
+    char_count = extract_number_from_selectors(soup, DETAIL_CHAR_SELECTORS)
+    if char_count is None:
+        char_count = extract_characters_from_textual_labels(soup)
+    tags = extract_tags(soup)
+    return stars, char_count, tags
+
+
+def collect_episode_datetimes(html: str) -> List[datetime]:
+    soup = BeautifulSoup(html, "lxml")
+    datetimes: List[datetime] = []
+    for time_tag in soup.select("time[datetime]"):
+        raw = (time_tag.get("datetime") or "")[:10]
         try:
-            dts.append(datetime.fromisoformat(val))
-        except:
-            pass
-    return dts
-# ----------------------------------------
+            datetimes.append(datetime.fromisoformat(raw))
+        except ValueError:
+            continue
+    return datetimes
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def fetch_html(driver, url: str) -> str:
-    driver.get(url)
-    time.sleep(DETAIL_SLEEP)
-    return driver.page_source
-
-
-def card_select_all(html: str) -> Tuple[BeautifulSoup, List]:
-    soup = BeautifulSoup(html, "lxml")
-    cards = soup.select("div.widget-workCard")
-    if not cards:
-        cards = [a.parent for a in soup.select("h3 a[href^='/works/']")]
-    return soup, cards
-
-def card_title_and_url(card) -> Optional[tuple]:
-    a = card.select_one("h3 a[href^='/works/']") or card.select_one("a[href^='/works/']")
-    if not a: return None
-    return a.get_text(strip=True), "https://kakuyomu.jp" + a["href"]
-
-def card_stars(card) -> Optional[int]:
-    for sel in [
-        "span.widget-workCard-reviewCount",
-        "span.widget-workCard-reviewPoints",
-        "span.widget-workCard-reviewPoint",
-        "span.reviewCount",
-        "span.reviewPoints",
-        "[data-testid='review-count']",
-        "[data-testid='review-point']",
-    ]:
-        el = card.select_one(sel)
-        if el and el.get_text(strip=True):
-            return parse_number(el.get_text(strip=True))
+def find_next_page_url(soup: BeautifulSoup) -> Optional[str]:
+    next_link = soup.select_one("a[rel='next']")
+    if next_link and next_link.get("href"):
+        return urljoin("https://kakuyomu.jp", next_link["href"])
+    alt_link = soup.select_one(".pager__item--next a, .pagination-next a")
+    if alt_link and alt_link.get("href"):
+        return urljoin("https://kakuyomu.jp", alt_link["href"])
+    for anchor in soup.select("a"):
+        if anchor.get_text(strip=True) in ("次へ", "次", "Next") and anchor.get("href"):
+            return urljoin("https://kakuyomu.jp", anchor["href"])
     return None
 
-def card_chars(card) -> Optional[int]:
-    for sel in ["span.widget-workCard-charCount", "span.charCount", "[data-testid='char-count']"]:
-        el = card.select_one(sel)
-        if el and el.get_text(strip=True):
-            return parse_number(el.get_text(strip=True))
-    return None
 
-def detail_fallbacks_if_missing(stars, chars, detail_soup):
-    if stars is None:
-        for sel in [
-            "span.widget-workHeader-reviewPoints",
-            "span.widget-workHeader-reviewPoint",
-            "span.reviewPoints",
-            "span.reviewCount",
-            "[data-testid='review-point']",
-            "[data-testid='review-count']",
-        ]:
-            el = detail_soup.select_one(sel)
-            if el and el.get_text(strip=True):
-                stars = parse_number(el.get_text(strip=True))
-                if stars is not None:
-                    break
-
-    if chars is None:
-        for sel in ["span.charCount", "[data-testid='char-count']"]:
-            el = detail_soup.select_one(sel)
-            if el and el.get_text(strip=True):
-                chars = parse_number(el.get_text(strip=True))
-                break
-    return stars, chars
-
-
-def crawl_all_episode_pages(driver, episodes_url: str, artifact_dir: Path, work_id: str) -> List[datetime]:
-    """
-    目次（/episodes）をページ送りして、全ページの <time datetime> を集約。
-    次ページ判定は rel=next / .pager__item--next / 「次へ」リンク などを順に探す。
-    """
+def fetch_first_episode_date(client: KakuyomuClient, episodes_url: str) -> Optional[datetime]:
+    visited: set[str] = set()
+    current_url = episodes_url
+    page_count = 0
     all_dates: List[datetime] = []
-    seen_urls = set()
-    page_idx = 1
-    url = episodes_url
 
-    while url and url not in seen_urls and page_idx <= 200:  # 安全上限
-        seen_urls.add(url)
-        html = fetch_html(driver, url)
-        (artifact_dir / f"episodes_{work_id}_{page_idx}.html").write_text(html, encoding="utf-8")
+    while current_url and current_url not in visited and page_count < 200:
+        visited.add(current_url)
+        html = client.fetch_html(current_url)
         soup = BeautifulSoup(html, "lxml")
+        all_dates.extend(collect_episode_datetimes(html))
+        current_url = find_next_page_url(soup)
+        page_count += 1
 
-        # そのページの日時を追加
-        all_dates.extend(pick_first_date_from_html(html))
-
-        # 次ページ探索
-        next_href = None
-        # 1) rel=next
-        a = soup.select_one("a[rel='next']")
-        if a and a.get("href"): next_href = a["href"]
-        # 2) クラス系
-        if not next_href:
-            b = soup.select_one(".pager__item--next a, .pagination-next a")
-            if b and b.get("href"): next_href = b["href"]
-        # 3) 文言でのフォールバック
-        if not next_href:
-            for c in soup.select("a"):
-                txt = c.get_text(strip=True)
-                if txt in ("次へ", "次", "Next") and c.get("href"):
-                    next_href = c["href"]; break
-
-        if next_href:
-            url = urljoin("https://kakuyomu.jp", next_href)
-            page_idx += 1
-            time.sleep(EPAGE_SLEEP)
-        else:
-            break
-
-    return all_dates
+    return min(all_dates) if all_dates else None
 
 
-def main():
-    driver = get_driver()
+def scrape_harem_works() -> List[WorkRecord]:
+    client = KakuyomuClient()
+    records: List[WorkRecord] = []
 
-    # 出力先の絶対パス
-    workspace      = Path.cwd()
-    ARTIFACT_PATH  = workspace / ARTIFACT_DIR_NAME
-    ARTIFACT_PATH.mkdir(exist_ok=True, parents=True)
-    ALL_PATH       = workspace / ALL_CSV_NAME
-    FILTERED_PATH  = workspace / FILTERED_CSV_NAME
-    MISMATCH_PATH  = ARTIFACT_PATH / MISMATCH_CSV_NAME
-
-    all_rows: List[dict] = []
-    mismatch_rows: List[dict] = []
-    last_page = 0
-
-    for page in range(1, MAX_PAGES + 1):
-        page_url = build_page_url(BASE_URL, page)
-        html = fetch_html(driver, page_url)
-        (ARTIFACT_PATH / f"page_{page}.html").write_text(html, encoding="utf-8")
-        driver.save_screenshot(str(ARTIFACT_PATH / f"page_{page}.png"))
-
-        soup, cards = card_select_all(html)
+    for page in range(1, LISTING_MAX_PAGES + 1):
+        listing_url = build_listing_url(page)
+        listing_html = client.fetch_html(listing_url)
+        soup = BeautifulSoup(listing_html, "lxml")
+        cards = soup.select(LISTING_CARD_SELECTOR)
         if not cards:
-            print(f"page {page}: no cards -> stop")
+            # fallback: some pages wrap cards differently
+            cards = [anchor.parent for anchor in soup.select("h3 a[href^='/works/']")]
+        if not cards:
             break
 
-        print(f"page {page}: cards={len(cards)}")
-        last_page = page
-
-        for idx, card in enumerate(cards, 1):
-            tit_url = card_title_and_url(card)
-            if not tit_url: continue
-            title, work_url = tit_url
-
-            stars = card_stars(card)
-            chars = card_chars(card)
-            tags_list = collect_tags(card)
-            has_harem = "ハーレム" in (tags_list or "")
-
-            # 作品詳細
-            detail_html = fetch_html(driver, work_url)
-            detail_soup = BeautifulSoup(detail_html, "lxml")
-            notice = detect_sexual_notice(detail_soup)
-            tags_detail = collect_tags(detail_soup)
-
-            # 目次（全ページ巡回して最古日を初回公開日に）
-            episodes_url = work_url + "/episodes"
-            # work_id は /works/xxxxxxxxxxxx の末尾を想定
-            work_id = work_url.rstrip("/").split("/")[-1]
+        for card in cards:
             try:
-                all_dates = crawl_all_episode_pages(driver, episodes_url, ARTIFACT_PATH, work_id)
-            except Exception:
-                # /episodes が無い等 → 詳細ページ内の <time> で代用
-                all_dates = pick_first_date_from_html(detail_html)
+                title, url, stars, char_count, tags = parse_card(card)
+            except ValueError:
+                continue
 
-            first_date = min(all_dates) if all_dates else None
+            detail_html = client.fetch_html(url)
+            detail_stars, detail_chars, detail_tags = parse_detail_page(detail_html)
+            if detail_stars is not None:
+                stars = detail_stars
+            if detail_chars is not None:
+                char_count = detail_chars
+            if detail_tags:
+                tags = detail_tags
 
-            # 欠損フォールバック
-            stars, chars = detail_fallbacks_if_missing(stars, chars, detail_soup)
+            episodes_url = url.rstrip("/") + "/episodes"
+            first_episode_date = fetch_first_episode_date(client, episodes_url)
 
-            meets = (
-                isinstance(stars, int) and stars >= MIN_STARS and
-                isinstance(chars, int) and chars >= MIN_CHARS and
-                bool(notice) and bool(has_harem) and
-                (first_date is not None and first_date >= MIN_DATE)
+            record = WorkRecord(
+                title=title,
+                url=url,
+                stars=stars,
+                total_chars=char_count,
+                first_episode_date=first_episode_date,
+                tags=tags,
             )
+            records.append(record)
 
-            row = {
-                "title": title,
-                "url": work_url,
-                "stars": stars if stars is not None else "",
-                "total_chars": chars if chars is not None else "",
-                "notice_sexual": notice,
-                "first_episode_date": first_date.strftime("%Y-%m-%d") if first_date else "",
-                "tags": tags_list,
-                "tags_detail": tags_detail,
-                "meets_conditions": meets
-            }
-            all_rows.append(row)
+        # continue until the site stops returning cards
+    return records
 
-            # 不完全な行は mismatch 候補として保存
-            if (row["stars"] == "" or row["total_chars"] == "" or not row["notice_sexual"] or "ハーレム" not in str(row["tags"]) or row["first_episode_date"] == ""):
-                mismatch_rows.append(row)
 
-        time.sleep(PAGE_SLEEP)
+def filter_records(records: Iterable[WorkRecord]) -> List[WorkRecord]:
+    return [record for record in records if record.meets_requirements()]
 
-    driver.quit()
 
-    # --- CSV出力 ---
-    headers = ["title","url","stars","total_chars","notice_sexual","first_episode_date","tags","tags_detail","meets_conditions"]
+def write_csv(records: Sequence[WorkRecord], destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    headers = ["title", "url", "stars", "total_chars", "first_episode_date", "tags"]
+    with destination.open("w", newline="", encoding="utf-8-sig") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(headers)
+        for record in records:
+            writer.writerow(record.as_csv_row())
 
-    # 全件（監査）
-    with open(ALL_PATH, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=headers); w.writeheader(); w.writerows(all_rows)
 
-    # 条件一致のみ（最終成果物）
-    filtered = [r for r in all_rows if r["meets_conditions"]]
-    with open(FILTERED_PATH, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=headers); w.writeheader(); w.writerows(filtered)
-
-    # mismatch
-    if mismatch_rows:
-        with open(MISMATCH_PATH, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=headers); w.writeheader(); w.writerows(mismatch_rows)
-
-    # サマリ
-    (ARTIFACT_PATH / "scrape_summary.txt").write_text(
-        f"pages_processed={last_page}\nrows_all={len(all_rows)}\nrows_filtered={len(filtered)}\n",
-        encoding="utf-8"
-    )
-    print(f"Saved: ALL={ALL_PATH} ({len(all_rows)})  FILTERED={FILTERED_PATH} ({len(filtered)})  mismatch={len(mismatch_rows)}")
+def main() -> None:
+    all_records = scrape_harem_works()
+    filtered_records = filter_records(all_records)
+    write_csv(filtered_records, OUTPUT_CSV)
+    print(f"Total works scanned: {len(all_records)}")
+    print(f"Works meeting criteria: {len(filtered_records)}")
+    print(f"Output written to: {OUTPUT_CSV.resolve()}")
 
 
 if __name__ == "__main__":
     main()
-
