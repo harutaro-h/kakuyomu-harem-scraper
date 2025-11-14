@@ -30,8 +30,12 @@ BASE_URL = "https://kakuyomu.jp/tags/ハーレム"
 MIN_START_DATE = datetime(2025, 4, 1)
 MIN_STAR_COUNT = 3000
 MIN_CHARACTER_COUNT = 50_000
-REQUEST_DELAY_SECONDS = 1.0
-LISTING_MAX_PAGES = 200
+# ★ 負荷軽減のためリクエスト間隔を 2 秒に伸ばす
+REQUEST_DELAY_SECONDS = 2.0
+# ★ 一覧ページの上限を控えめに（必要なら増やす）
+LISTING_MAX_PAGES = 80
+# ★ 1作品あたり /episodes を何ページまで見るかの上限
+MAX_EPISODE_PAGES_PER_WORK = 50
 OUTPUT_CSV = Path("kakuyomu_harem_filtered.csv")
 
 LISTING_CARD_SELECTOR = "div.widget-workCard"
@@ -186,7 +190,7 @@ def extract_tags(container: BeautifulSoup | Tag) -> List[str]:
     tags = collect_texts(container, CARD_TAG_SELECTORS)
     if not tags:
         tags = collect_texts(container, DETAIL_TAG_SELECTORS)
-    seen = []
+    seen: List[str] = []
     for tag in tags:
         if tag not in seen:
             seen.append(tag)
@@ -257,12 +261,28 @@ def fetch_first_episode_date(client: KakuyomuClient, episodes_url: str) -> Optio
     current_url = episodes_url
     page_count = 0
     all_dates: List[datetime] = []
+    min_seen: Optional[datetime] = None
 
-    while current_url and current_url not in visited and page_count < 200:
+    while (
+        current_url
+        and current_url not in visited
+        and page_count < MAX_EPISODE_PAGES_PER_WORK
+    ):
         visited.add(current_url)
         html = client.fetch_html(current_url)
         soup = BeautifulSoup(html, "lxml")
-        all_dates.extend(collect_episode_datetimes(html))
+
+        page_dates = collect_episode_datetimes(html)
+        all_dates.extend(page_dates)
+        if page_dates:
+            page_min = min(page_dates)
+            if min_seen is None or page_min < min_seen:
+                min_seen = page_min
+
+        # ★ すでに MIN_START_DATE より古い話が見つかっていれば、これ以上巡回しない
+        if min_seen is not None and min_seen < MIN_START_DATE:
+            break
+
         current_url = find_next_page_url(soup)
         page_count += 1
 
@@ -290,6 +310,12 @@ def scrape_harem_works() -> List[WorkRecord]:
             except ValueError:
                 continue
 
+            # ★ 一覧カード時点で明らかに条件未満なら詳細/episodesを見に行かない
+            if stars is not None and stars < MIN_STAR_COUNT:
+                continue
+            if char_count is not None and char_count < MIN_CHARACTER_COUNT:
+                continue
+
             detail_html = client.fetch_html(url)
             detail_stars, detail_chars, detail_tags = parse_detail_page(detail_html)
             if detail_stars is not None:
@@ -298,6 +324,12 @@ def scrape_harem_works() -> List[WorkRecord]:
                 char_count = detail_chars
             if detail_tags:
                 tags = detail_tags
+
+            # ★ 詳細を見ても条件未満なら episodes に行かない
+            if stars is None or stars < MIN_STAR_COUNT:
+                continue
+            if char_count is None or char_count < MIN_CHARACTER_COUNT:
+                continue
 
             episodes_url = url.rstrip("/") + "/episodes"
             first_episode_date = fetch_first_episode_date(client, episodes_url)
