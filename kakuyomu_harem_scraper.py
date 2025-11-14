@@ -24,7 +24,8 @@ MIN_CHARS = 50000
 # 最低公開日。環境変数 KAKUYOMU_MIN_DATE (YYYY-MM-DD) で上書きできる。
 # 直近作品も拾いたい場合は 2020-01-01 等の過去日付に調整する。
 _MIN_DATE_ENV_VAR = "KAKUYOMU_MIN_DATE"
-_DEFAULT_MIN_DATE = "2018-01-01"
+# デフォルトでは、2025年以降に公開された作品のみを対象にする。
+_DEFAULT_MIN_DATE = "2025-01-01"
 _min_date_raw = os.environ.get(_MIN_DATE_ENV_VAR, _DEFAULT_MIN_DATE)
 try:
     MIN_DATE = datetime.fromisoformat(_min_date_raw)
@@ -117,7 +118,15 @@ def card_title_and_url(card) -> Optional[tuple]:
     return a.get_text(strip=True), "https://kakuyomu.jp" + a["href"]
 
 def card_stars(card) -> Optional[int]:
-    for sel in ["span.widget-workCard-reviewCount", "span.reviewCount", "[data-testid='review-count']"]:
+    for sel in [
+        "span.widget-workCard-reviewCount",
+        "span.widget-workCard-reviewPoints",
+        "span.widget-workCard-reviewPoint",
+        "span.reviewCount",
+        "span.reviewPoints",
+        "[data-testid='review-count']",
+        "[data-testid='review-point']",
+    ]:
         el = card.select_one(sel)
         if el and el.get_text(strip=True):
             return parse_number(el.get_text(strip=True))
@@ -131,6 +140,21 @@ def card_chars(card) -> Optional[int]:
     return None
 
 def detail_fallbacks_if_missing(stars, chars, detail_soup):
+    if stars is None:
+        for sel in [
+            "span.widget-workHeader-reviewPoints",
+            "span.widget-workHeader-reviewPoint",
+            "span.reviewPoints",
+            "span.reviewCount",
+            "[data-testid='review-point']",
+            "[data-testid='review-count']",
+        ]:
+            el = detail_soup.select_one(sel)
+            if el and el.get_text(strip=True):
+                stars = parse_number(el.get_text(strip=True))
+                if stars is not None:
+                    break
+
     if chars is None:
         for sel in ["span.charCount", "[data-testid='char-count']"]:
             el = detail_soup.select_one(sel)
@@ -300,4 +324,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
