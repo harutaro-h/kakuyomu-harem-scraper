@@ -1,7 +1,7 @@
 name: Kakuyomu Harem Scraper
 
 on:
-  workflow_dispatch:  # 手動実行用
+  workflow_dispatch:  # 手動実行
   schedule:
     - cron: "0 15 * * *"  # 毎日 00:00 JST（15:00 UTC）
 
@@ -19,21 +19,10 @@ jobs:
         with:
           python-version: "3.11"
 
-- name: Install dependencies
-  run: pip install -r requirements.txt
-
-
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install selenium beautifulsoup4 tenacity lxml
-
-      - name: Install Chromium & Chromedriver
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y chromium-browser chromium-chromedriver
-          sudo ln -sf /usr/bin/chromium-browser /usr/bin/google-chrome
+          pip install -r requirements.txt
 
       - name: Run scraper
         run: |
@@ -41,14 +30,12 @@ jobs:
           python kakuyomu_harem_scraper.py
         env:
           PYTHONUNBUFFERED: 1
-          CHROME_BIN: /usr/bin/chromium-browser
 
       - name: Upload artifacts (CSV, logs, and HTML evidence)
         uses: actions/upload-artifact@v4
         with:
           name: kakuyomu_harem_run
           path: |
-            ${{ github.workspace }}/kakuyomu_harem_all.csv
             ${{ github.workspace }}/kakuyomu_harem_filtered.csv
-            ${{ github.workspace }}/artifacts/**
           if-no-files-found: warn
+
