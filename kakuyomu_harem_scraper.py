@@ -130,6 +130,11 @@ class KakuyomuClient:
         if self.delay_seconds:
             time.sleep(self.delay_seconds)
         return response.text
+        
+
+def is_not_found_error(error: requests.HTTPError) -> bool:
+    response = getattr(error, "response", None)
+    return bool(response and response.status_code == 404)
 def build_listing_url(page: int) -> str:
     """Return the harem tag listing URL for a specific page."""
     base_parts = urlsplit(BASE_URL)
@@ -230,7 +235,12 @@ def fetch_first_episode_date(client: KakuyomuClient, episodes_url: str) -> Optio
         and page_count < MAX_EPISODE_PAGES_PER_WORK
     ):
         visited.add(current_url)
-        html = client.fetch_html(current_url)
+        try:
+            html = client.fetch_html(current_url)
+        except requests.HTTPError as error:
+            if is_not_found_error(error):
+                break
+            raise
         soup = BeautifulSoup(html, "lxml")
 
         page_dates = collect_episode_datetimes(html)
@@ -272,8 +282,12 @@ def scrape_harem_works() -> List[WorkRecord]:
                 continue
             if char_count is not None and char_count < MIN_CHARACTER_COUNT:
                 continue
-
-            detail_html = client.fetch_html(url)
+            try:
+                detail_html = client.fetch_html(url)
+            except requests.HTTPError as error:
+                if is_not_found_error(error):
+                    continue
+                raise
             detail_stars, detail_chars, detail_tags = parse_detail_page(detail_html)
             if detail_stars is not None:
                 stars = detail_stars
@@ -289,7 +303,12 @@ def scrape_harem_works() -> List[WorkRecord]:
                 continue
 
             episodes_url = url.rstrip("/") + "/episodes"
-            first_episode_date = fetch_first_episode_date(client, episodes_url)
+            try:
+                first_episode_date = fetch_first_episode_date(client, episodes_url)
+            except requests.HTTPError as error:
+                if is_not_found_error(error):
+                    continue
+                raise
 
             record = WorkRecord(
                 title=title,
