@@ -1,537 +1,317 @@
-#!/usr/bin/env python3
-"""
-Kakuyomu harem tag scraper.
-
-This script enumerates Kakuyomu works tagged with "ハーレム" and filters them by:
-- first episode posted on or after MIN_START_DATE (default: 2025-04-01, overridable)
-- review star (point) count of at least 3,000
-- total character count of at least 50,000
-- tag includes "ハーレム"
-- notice includes "性描写あり"
-
-The results are written to `kakuyomu_harem_filtered.csv` in UTF-8 with BOM.
-"""
-
-from __future__ import annotations
+import requests
+from bs4 import BeautifulSoup
+import time
 import csv
 import re
-import os
-import time
-from dataclasses import dataclass
+import sys
 from datetime import datetime
-from pathlib import Path
-from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
-
-import requests
-from bs4 import BeautifulSoup, Tag
+from urllib.parse import urljoin
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ============================================================
-# 設定
-# ============================================================
-
-BASE_URL = "https://kakuyomu.jp/tags/ハーレム"
-DEFAULT_START_DATE = "2025-04-01"
-
-_min = os.getenv("KAKUYOMU_MIN_START_DATE", DEFAULT_START_DATE)
-try:
-    MIN_START_DATE = datetime.fromisoformat(_min)
-except Exception:
-    MIN_START_DATE = datetime(2025, 4, 1)
-
-MIN_STAR_COUNT = 3000
-MIN_CHARACTER_COUNT = 50_000
-
-REQUEST_DELAY_SECONDS = 2.0
-LISTING_MAX_PAGES = 80
-MAX_EPISODE_PAGES_PER_WORK = 50
-
-OUTPUT_CSV = Path("kakuyomu_harem_filtered.csv")
-
-LISTING_CARD_SELECTOR = "div.widget-workCard"
-CARD_LINK_SELECTOR = "h3 a[href^='/works/'], a[href^='/works/']"
-
-CARD_TAG_SELECTORS = (
-    ".widget-workCard-tag",
-    ".tag",
-    "[data-testid='tag']",
-)
-
-STAR_SELECTORS = (
-    "span.widget-workCard-reviewPoints",
-    "span.widget-workCard-reviewPoint",
-    "span.widget-workCard-reviewCount",
-    "span.reviewPoints",
-    "span.reviewPoint",
-    "span.reviewCount",
-    "[data-testid='review-point']",
-    "[data-testid='review-count']",
-)
-
-CHAR_COUNT_SELECTORS = (
-    "span.widget-workCard-charCount",
-    "span.charCount",
-    "[data-testid='char-count']",
-)
-
-DETAIL_STAR_SELECTORS = (
-    "span.widget-workHeader-reviewPoints",
-    "span.widget-workHeader-reviewPoint",
-    "span.reviewPoints",
-    "span.reviewPoint",
-    "span.reviewCount",
-    "[data-testid='review-point']",
-    "[data-testid='review-count']",
-)
-
-DETAIL_CHAR_SELECTORS = (
-    "span.widget-workHeader-charCount",
-    "span.widget-workInfo-charCount",
-    "span.charCount",
-    "[data-testid='char-count']",
-)
-
-DETAIL_TAG_SELECTORS = (
-    "[data-testid='tag']",
-    ".widget-workTag-item",
-    ".work-tag",
-    ".tag",
-)
-
-NOTICE_SELECTORS = (
-    ".workHeader-notice",
-    ".widget-workHeader-notice",
-    ".workNotice",
-    "[data-testid='notice']",
-    ".notice",
-)
-
-TEXTUAL_CHAR_LABELS = ("総文字数", "文字数")
-
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-# ============================================================
-# データモデル
-# ============================================================
-
-@dataclass
-class WorkRecord:
-    title: str
-    url: str
-    stars: int
-    total_chars: int
-    first_episode_date: datetime
-    tags: Sequence[str]
-    notice_sexual: bool
-
-    def meets(self) -> bool:
-        return (
-            self.stars >= MIN_STAR_COUNT
-            and self.total_chars >= MIN_CHARACTER_COUNT
-            and self.first_episode_date >= MIN_START_DATE
-            and any(tag == "ハーレム" for tag in self.tags)
-            and self.notice_sexual
-        )
-
-    def as_csv_row(self) -> List[str]:
-        return [
-            self.title,
-            self.url,
-            str(self.stars),
-            str(self.total_chars),
-            self.first_episode_date.strftime("%Y-%m-%d"),
-            " ".join(self.tags),
-            "True" if self.notice_sexual else "False",
-        ]
-
-# ============================================================
-# HTTP クライアント
-# ============================================================
-
-class KakuyomuClient:
-    def __init__(self, delay_seconds: float = REQUEST_DELAY_SECONDS) -> None:
-        self.session = requests.Session()
-        retries = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=("GET",),
-        )
-        adapter = HTTPAdapter(max_retries=retries)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
-        self.session.headers["User-Agent"] = USER_AGENT
-        self.delay_seconds = delay_seconds
-
-    def fetch_html(self, url: str) -> str:
-        resp = self.session.get(url, timeout=20)
-        resp.raise_for_status()
-        if self.delay_seconds:
-            time.sleep(self.delay_seconds)
-        return resp.text
-
-# ============================================================
-# HTML Utility
-# ============================================================
-
-def build_listing_url(page: int) -> str:
-    u = urlsplit(BASE_URL)
-    q = dict(parse_qsl(u.query))
-    q.setdefault("sort", "popular")
-    q["page"] = str(page)
-    return urlunsplit((u.scheme, u.netloc, u.path, urlencode(q), u.fragment))
-
-def clean_number(s: str) -> Optional[int]:
-    digits = re.sub(r"[^\d]", "", s or "")
-    return int(digits) if digits else None
-
-def collect_texts(soup: BeautifulSoup | Tag, selectors: Sequence[str]) -> List[str]:
-    values: List[str] = []
-    for sel in selectors:
-        for el in soup.select(sel):
-            t = el.get_text(strip=True)
-            if t:
-                values.append(t)
-    return values
-
-def extract_number(soup: BeautifulSoup | Tag, selectors: Sequence[str]) -> Optional[int]:
-    for sel in selectors:
-        el = soup.select_one(sel)
-        if el:
-            n = clean_number(el.get_text(strip=True))
-            if n is not None:
-                return n
-    return None
-
-def extract_tags(soup: BeautifulSoup | Tag) -> List[str]:
-    tags = collect_texts(soup, CARD_TAG_SELECTORS)
-    if not tags:
-        tags = collect_texts(soup, DETAIL_TAG_SELECTORS)
-    uniq = []
-    for t in tags:
-        if t not in uniq:
-            uniq.append(t)
-    return uniq
-
-def extract_total_chars_from_textlabel(soup: BeautifulSoup) -> Optional[int]:
-    for label in TEXTUAL_CHAR_LABELS:
-        dt = soup.find("dt", string=lambda v: isinstance(v, str) and label in v)
-        if dt:
-            dd = dt.find_next("dd")
-            if dd:
-                n = clean_number(dd.get_text(strip=True))
-                if n is not None:
-                    return n
-    return None
-
-def detect_notice_sexual(soup: BeautifulSoup) -> bool:
-    for sel in NOTICE_SELECTORS:
-        for el in soup.select(sel):
-            if "性描写あり" in el.get_text(" ", strip=True):
-                return True
-    return "性描写あり" in soup.get_text(" ", strip=True)
-
-def parse_card(card: Tag):
-    link = card.select_one(CARD_LINK_SELECTOR)
-    if not link or not link.get("href"):
-        raise ValueError("Missing work link")
-    title = link.get_text(strip=True)
-    url = urljoin("https://kakuyomu.jp", link["href"])
-    stars = extract_number(card, STAR_SELECTORS)
-    chars = extract_number(card, CHAR_COUNT_SELECTORS)
-    tags = extract_tags(card)
-    return title, url, stars, chars, tags
-
-def parse_detail(html: str):
-    soup = BeautifulSoup(html, "lxml")
-    stars = extract_number(soup, DETAIL_STAR_SELECTORS)
-    chars = extract_number(soup, DETAIL_CHAR_SELECTORS)
-    if chars is None:
-        chars = extract_total_chars_from_textlabel(soup)
-    tags = extract_tags(soup)
-    notice = detect_notice_sexual(soup)
-    return stars, chars, tags, notice
-
-def collect_episode_datetimes(soup: BeautifulSoup) -> List[datetime]:
-    datetimes = []
-    for tag in soup.select(
-        "section[id*='episode'] time[datetime], "
-        "article time[datetime], "
-        "li time[datetime], "
-        "time[datetime]"
-    ):
-        raw = (tag.get("datetime") or "")[:10]
-        try:
-            datetimes.append(datetime.fromisoformat(raw))
-        except Exception:
-            pass
-    return datetimes
-
-def find_next_page_url(soup: BeautifulSoup) -> Optional[str]:
-    next_link = soup.select_one("a[rel='next']")
-    if next_link and next_link.get("href"):
-        return urljoin("https://kakuyomu.jp", next_link["href"])
-
-    alt = soup.select_one(".pager__item--next a, .pagination-next a")
-    if alt and alt.get("href"):
-        return urljoin("https://kakuyomu.jp", alt["href"])
-
-    for a in soup.select("a"):
-        if a.get_text(strip=True) in ("次へ", "次", "Next") and a.get("href"):
-            return urljoin("https://kakuyomu.jp", a["href"])
-
-    return None
-
-def fetch_first_episode_date(client: KakuyomuClient, episodes_url: str) -> Optional[datetime]:
-    visited = set()
-    url = episodes_url
-    page_count = 0
-    all_dates: List[datetime] = []
-    min_seen = None
-
-    while url and url not in visited and page_count < MAX_EPISODE_PAGES_PER_WORK:
-        visited.add(url)
-        html = client.fetch_html(url)
-        soup = BeautifulSoup(html, "lxml")
-        dates = collect_episode_datetimes(soup)
-        all_dates.extend(dates)
-
-        if dates:
-            page_min = min(dates)
-            if min_seen is None or page_min < min_seen:
-                min_seen = page_min
-
-        if min_seen is not None and min_seen < MIN_START_DATE:
-            break
-
-        url = find_next_page_url(soup)
-        page_count += 1
-
-    return min(all_dates) if all_dates else None
-
-
-# ============================================================
-# スクレイピングメイン
-# ============================================================
-
-def scrape_harem_works(
-    client: Optional[KakuyomuClient] = None,
-    listing_max_pages: int = LISTING_MAX_PAGES,
-) -> List[WorkRecord]:
-
-    client = client or KakuyomuClient()
-    records: List[WorkRecord] = []
-
-    for page in range(1, listing_max_pages + 1):
-        listing_url = build_listing_url(page)
-        try:
-            listing_html = client.fetch_html(listing_url)
-        except Exception as exc:
-            print(f"[ERROR] Listing fetch failed {listing_url}: {exc}")
-            break
-
-        soup = BeautifulSoup(listing_html, "lxml")
-        cards = soup.select(LISTING_CARD_SELECTOR)
-
-        if not cards:
-            cards = [a.parent for a in soup.select("h3 a[href^='/works/']")]
-        if not cards:
-            break
-
-        for card in cards:
-            try:
-                title, url, stars_c, chars_c, tags = parse_card(card)
-            except ValueError:
-                continue
-
-            # 一覧段階 (前処理フィルタ)
-            if stars_c is not None and stars_c < MIN_STAR_COUNT:
-                continue
-            if chars_c is not None and chars_c < MIN_CHARACTER_COUNT:
-                continue
-
-            try:
-                detail_html = client.fetch_html(url)
-            except Exception as exc:
-                print(f"[ERROR] Failed detail fetch {url}: {exc}")
-                continue
-
-            detail_stars, detail_chars, detail_tags, notice = parse_detail(detail_html)
-
-            stars = detail_stars if detail_stars is not None else stars_c
-            chars = detail_chars if detail_chars is not None else chars_c
-            tags = detail_tags or tags
-
-            # 詳細段階のフィルタ
-            if stars is None or stars < MIN_STAR_COUNT:
-                continue
-            if chars is None or chars < MIN_CHARACTER_COUNT:
-                continue
-            if not notice:
-                continue
-
-            # /episodes 全ページをたどって初回日時を取得
-            episodes_url = url.rstrip("/") + "/episodes"
-            try:
-                first_dt = fetch_first_episode_date(client, episodes_url)
-            except Exception as exc:
-                print(f"[ERROR] Episode fetch error {episodes_url}: {exc}")
-                continue
-
-            if first_dt is None or first_dt < MIN_START_DATE:
-                continue
-
-            record = WorkRecord(
-                title=title,
-                url=url,
-                stars=stars,
-                total_chars=chars,
-                first_episode_date=first_dt,
-                tags=tags,
-                notice_sexual=notice,
-            )
-            records.append(record)
-
-    return records
-
-
-# ============================================================
-# CSV 出力
-# ============================================================
-
-def write_csv(records: Sequence[WorkRecord], path: Path) -> None:
-    path.parent.mkdir(exist_ok=True, parents=True)
-    headers = [
-        "title",
-        "url",
-        "stars",
-        "total_chars",
-        "first_episode_date",
-        "tags",
-        "notice_sexual",
-    ]
-
-    with path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
-        for r in records:
-            writer.writerow(r.as_csv_row())
-
-
-# ============================================================
-# メイン
-# ============================================================
-
-def main() -> None:
-    records = scrape_harem_works()
-    write_csv(records, OUTPUT_CSV)
-    print(f"Works scanned (valid & included) : {len(records)}")
-    print(f"Output written to: {OUTPUT_CSV.resolve()}")
-
-
-# ============================================================
-# Mock テスト（オフライン検証用）
-# ============================================================
-
-class MockKakuyomuClient(KakuyomuClient):
-    def __init__(self, responses: Mapping[str, str]):
-        super().__init__(delay_seconds=0)
-        self.responses = dict(responses)
-
-    def fetch_html(self, url: str) -> str:
-        if url not in self.responses:
-            raise requests.HTTPError(f"Mock missing for {url}")
-        return self.responses[url]
-
-
-def _build_mock_html() -> Mapping[str, str]:
-    """オフライン検証用 HTML セット"""
-
-    listing_page = """
-    <html><body>
-      <div class="widget-workCard">
-        <h3><a href="/works/111">Hero and Harem</a></h3>
-        <span class="widget-workCard-reviewPoints">3500</span>
-        <span class="widget-workCard-charCount">60000</span>
-        <span class="widget-workCard-tag">ハーレム</span>
-      </div>
-      <div class="widget-workCard">
-        <h3><a href="/works/222">No Notice</a></h3>
-        <span class="widget-workCard-reviewPoints">3500</span>
-        <span class="widget-workCard-charCount">60000</span>
-        <span class="widget-workCard-tag">ハーレム</span>
-      </div>
-      <a rel="next" href="/tags/ハーレム?sort=popular&page=2">次</a>
-    </body></html>
+# ==========================================
+# 設定・定数
+# ==========================================
+
+# 検索条件
+TARGET_TAG_SEARCH = "ハーレム"
+TARGET_START_DATE = datetime(2025, 4, 1) # この日付以降に開始
+MIN_STARS = 3000
+MIN_CHARS = 50000
+
+# URL関連
+BASE_URL = "https://kakuyomu.jp"
+SEARCH_URL = f"{BASE_URL}/tags/{TARGET_TAG_SEARCH}"
+
+# 負荷対策設定
+SLEEP_TIME = 2.0  # 1リクエストあたりの待機時間(秒)
+MAX_LISTING_PAGES = 80  # 検索結果の最大巡回ページ数
+MAX_EPISODE_PAGES = 50  # 1作品あたりのエピソード最大巡回ページ数
+TIMEOUT = 15
+
+# 出力ファイル名
+OUTPUT_FILENAME = "kakuyomu_harem_filtered.csv"
+
+# User-Agent (Github Actions上で動くことを明示しつつ、社内ツールであることを記載)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 (KADOKAWA_Internal_Tool_Test/GitHubActions)"
+}
+
+# ==========================================
+# セッションの作成 (リトライ機能付き)
+# ==========================================
+def create_session():
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.headers.update(HEADERS)
+    return session
+
+# ==========================================
+# ヘルパー関数
+# ==========================================
+
+def fetch_soup(session, url):
     """
-
-    empty_listing = "<html><body>no more</body></html>"
-
-    detail_111 = """
-    <html><body>
-      <span class="widget-workHeader-reviewPoints">3600</span>
-      <span class="widget-workHeader-charCount">62000</span>
-      <div data-testid="tag">ハーレム</div>
-      <div class="workHeader-notice">性描写あり</div>
-    </body></html>
+    URLを取得してBeautifulSoupオブジェクトを返す。
+    必ずsleepを挟む。
     """
+    print(f"Fetch: {url}")
+    try:
+        time.sleep(SLEEP_TIME)
+        response = session.get(url, timeout=TIMEOUT)
+        response.raise_for_status()
+        return BeautifulSoup(response.content, "lxml")
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching {url}: {e}", file=sys.stderr)
+        return None
 
-    detail_222 = """
-    <html><body>
-      <span class="widget-workHeader-reviewPoints">3600</span>
-      <span class="widget-workHeader-charCount">62000</span>
-      <div data-testid="tag">ハーレム</div>
-      <div class="workHeader-notice">全年齢</div>
-    </body></html>
+def parse_int(text):
+    """文字列からカンマを除去して整数にする"""
+    if not text:
+        return 0
+    try:
+        # "12,345文字" -> "12345"
+        num_str = re.sub(r'[^\d]', '', text)
+        return int(num_str) if num_str else 0
+    except ValueError:
+        return 0
+
+def get_iso_date(text):
+    """YYYY-MM-DD形式の文字列をdatetimeオブジェクトに変換"""
+    try:
+        # datetime="2025-11-19T18:00:00Z" のような形式を想定
+        return datetime.fromisoformat(text.replace('Z', '+00:00')).replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
+
+# ==========================================
+# スクレイピングロジック
+# ==========================================
+
+def process_work(session, work_url, listing_stars, listing_chars):
     """
-
-    episodes_111 = """
-    <html><body>
-      <section id="episodes"><time datetime="2025-04-15">2025-04-15</time></section>
-    </body></html>
+    作品詳細ページを処理し、条件を満たすか判定する。
+    戻り値: 条件を満たせば辞書データ、満たさなければNone
     """
+    # 1. 作品詳細ページの取得
+    soup = fetch_soup(session, work_url)
+    if not soup:
+        return None
 
-    episodes_222 = """
-    <html><body>
-      <section id="episodes"><time datetime="2024-03-01">2024-03-01</time></section>
-    </body></html>
-    """
+    # タイトル取得
+    title_tag = soup.select_one('h1#workTitle, h1') 
+    title = title_tag.get_text(strip=True) if title_tag else "No Title"
 
+    # 星数取得（詳細ページで再確認）
+    stars = listing_stars # デフォルトは一覧の値
+    points_elm = soup.select_one('#workPoints') or soup.select_one('.js-stars-count')
+    if points_elm:
+        stars = parse_int(points_elm.get_text())
+
+    # 文字数取得
+    total_chars = listing_chars
+    chars_elm = soup.select_one('#workTotalCharacterCount')
+    if chars_elm:
+        total_chars = parse_int(chars_elm.get_text())
+
+    # 基本フィルタ（星数・文字数）
+    if stars < MIN_STARS or total_chars < MIN_CHARS:
+        print(f"  -> Skip: Stars({stars}) or Chars({total_chars}) below threshold.")
+        return None
+
+    # タグ取得
+    tags = []
+    tag_links = soup.select('[itemprop="keywords"] a, #tagList a, .TagList-module__tag___ a')
+    for link in tag_links:
+        tags.append(link.get_text(strip=True))
+    
+    if TARGET_TAG_SEARCH not in tags:
+        print(f"  -> Skip: '{TARGET_TAG_SEARCH}' tag missing.")
+        return None
+
+    # 注意書き「性描写あり」チェック
+    notice_sexual = False
+    notice_elms = soup.select('#workHeader-inner, .work-header-notice, .Notice-module__area, [aria-label="性描写あり"]')
+    header_text = " ".join([e.get_text() for e in notice_elms])
+    aria_labels = [e.get('aria-label', '') for e in soup.select('[aria-label]')]
+    
+    if "性描写あり" in header_text or "性描写あり" in aria_labels:
+        notice_sexual = True
+
+    if not notice_sexual:
+        print("  -> Skip: No sexual content notice.")
+        return None
+
+    # 2. 初回エピソード投稿日の取得と判定
+    first_date = get_first_episode_date(session, work_url)
+    
+    if not first_date:
+        print("  -> Skip: Could not determine start date.")
+        return None
+    
+    if first_date < TARGET_START_DATE:
+        print(f"  -> Skip: Started on {first_date.date()} (Before {TARGET_START_DATE.date()})")
+        return None
+
+    # 全ての条件をクリア
     return {
-        build_listing_url(1): listing_page,
-        build_listing_url(2): empty_listing,
-        "https://kakuyomu.jp/works/111": detail_111,
-        "https://kakuyomu.jp/works/222": detail_222,
-        "https://kakuyomu.jp/works/111/episodes": episodes_111,
-        "https://kakuyomu.jp/works/222/episodes": episodes_222,
+        'title': title,
+        'url': work_url,
+        'stars': stars,
+        'total_chars': total_chars,
+        'first_episode_date': first_date.strftime('%Y-%m-%d'),
+        'tags': " ".join(tags),
+        'notice_sexual': "True"
     }
 
+def get_first_episode_date(session, work_url):
+    """
+    エピソード一覧を巡回して、最も古い投稿日時を取得する。
+    ターゲット日付より古いものが見つかった時点で早期終了する。
+    """
+    episodes_url = f"{work_url}/episodes"
+    current_url = episodes_url
+    min_date = None
+    page_count = 0
 
-def run_mock_tests() -> None:
-    print("Running mock tests…")
-    mock = MockKakuyomuClient(_build_mock_html())
-    recs = scrape_harem_works(mock, listing_max_pages=2)
+    while current_url and page_count < MAX_EPISODE_PAGES:
+        page_count += 1
+        soup = fetch_soup(session, current_url)
+        if not soup:
+            break
 
-    assert len(recs) == 1, f"Expected 1 record, got {len(recs)}"
-    r = recs[0]
-    assert r.title == "Hero and Harem"
-    assert r.notice_sexual
-    assert r.stars >= MIN_STAR_COUNT
-    assert r.total_chars >= MIN_CHARACTER_COUNT
-    assert r.first_episode_date >= MIN_START_DATE
-    assert "ハーレム" in r.tags
-    print("Mock tests passed!")
+        # datetime属性を持つtimeタグを探す
+        time_tags = soup.select('li.widget-episode .widget-episode-date time, .EpisodeList-module__date___ time')
+        
+        if not time_tags:
+            break
 
+        found_dates = []
+        for tm in time_tags:
+            dt_str = tm.get('datetime')
+            if dt_str:
+                dt = get_iso_date(dt_str)
+                if dt:
+                    found_dates.append(dt)
+
+        if found_dates:
+            current_page_min = min(found_dates)
+            
+            # もしこのページの中に、ターゲット日付より前の日付があれば対象外確定
+            if current_page_min < TARGET_START_DATE:
+                return current_page_min 
+
+            if min_date is None or current_page_min < min_date:
+                min_date = current_page_min
+
+        # 次のページへ
+        next_link = soup.select_one('a[rel="next"], .pager-next a')
+        if next_link:
+            next_href = next_link.get('href')
+            current_url = urljoin(work_url, next_href)
+        else:
+            current_url = None
+
+    return min_date
+
+# ==========================================
+# メイン処理
+# ==========================================
+
+def main():
+    session = create_session()
+    results = []
+    total_scanned = 0
+    
+    print(f"Start scraping: {SEARCH_URL}")
+    print(f"Conditions: >= {TARGET_START_DATE.date()}, Stars >= {MIN_STARS}, Chars >= {MIN_CHARS}, Tag='ハーレム', Notice='性描写あり'")
+
+    for page in range(1, MAX_LISTING_PAGES + 1):
+        target_url = f"{SEARCH_URL}?sort=popular&page={page}"
+        
+        soup = fetch_soup(session, target_url)
+        if not soup:
+            print("Failed to retrieve listing page. Stopping.")
+            break
+
+        work_cards = soup.select('.widget-workCard')
+        if not work_cards:
+            work_cards = soup.select('[class*="WorkCard-module__card"]')
+
+        if not work_cards:
+            print(f"No works found on page {page}. Ending search.")
+            break
+
+        print(f"Processing page {page} ({len(work_cards)} works)...")
+
+        for card in work_cards:
+            total_scanned += 1
+            
+            link_tag = card.select_one('a[href^="/works/"]')
+            if not link_tag:
+                continue
+            
+            relative_link = link_tag.get('href')
+            if not re.match(r'^/works/\d+$', relative_link):
+                title_link = card.select_one('.widget-workCard-title a')
+                if title_link:
+                    relative_link = title_link.get('href')
+                else:
+                    continue
+
+            work_url = urljoin(BASE_URL, relative_link)
+
+            # 一覧での簡易フィルタリング
+            stars_text = "0"
+            star_elm = card.select_one('.widget-workCard-reviewPoints, [class*="Star-module__count"]')
+            if star_elm:
+                stars_text = star_elm.get_text()
+            listing_stars = parse_int(stars_text)
+
+            chars_text = "0"
+            char_elm = card.select_one('.widget-workCard-characterCount, [class*="Meta-module__characterCount"]')
+            if char_elm:
+                chars_text = char_elm.get_text()
+            listing_chars = parse_int(chars_text)
+
+            if listing_stars < (MIN_STARS * 0.8): 
+                continue
+            if listing_chars < (MIN_CHARS * 0.8):
+                continue
+
+            print(f"Checking: {work_url} (ListStars: {listing_stars})")
+            
+            try:
+                work_data = process_work(session, work_url, listing_stars, listing_chars)
+                if work_data:
+                    print(f"  [MATCH] Found: {work_data['title']}")
+                    results.append(work_data)
+            except Exception as e:
+                print(f"Error processing work {work_url}: {e}")
+                continue
+
+    if results:
+        print(f"\nWriting {len(results)} works to {OUTPUT_FILENAME}...")
+        with open(OUTPUT_FILENAME, 'w', encoding='utf-8-sig', newline='') as f:
+            fieldnames = ['title', 'url', 'stars', 'total_chars', 'first_episode_date', 'tags', 'notice_sexual']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(results)
+        print("Done.")
+    else:
+        print("\nNo works matched the criteria.")
+        # ファイルが作られないとArtifactアップロードでエラーになる可能性があるため空ファイルを作成
+        with open(OUTPUT_FILENAME, 'w', encoding='utf-8-sig', newline='') as f:
+            pass
+    
+    print(f"Total scanned (listing): {total_scanned}")
 
 if __name__ == "__main__":
-    import sys
-    if "--run-mock-tests" in sys.argv:
-        run_mock_tests()
-    else:
-        main()
+    main()
