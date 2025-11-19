@@ -1,7 +1,5 @@
 name: Run Kakuyomu Scraper
 
-# 手動実行（ボタンクリック）でのみ起動するように設定
-# ※定期実行(cron)はサーバー負荷を考慮し、必要な時だけ人間が実行するようにします
 on:
   workflow_dispatch:
 
@@ -9,33 +7,31 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     
-    # 実行時間の制限（万が一無限ループした時のための安全装置）
-    timeout-minutes: 60
+    # 安全のため360分（6時間）に設定
+    timeout-minutes: 360
 
     steps:
-      # 1. リポジトリのコードをチェックアウト
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Python環境のセットアップ
       - name: Set up Python 3.11
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      # 3. 依存ライブラリのインストール
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 lxml
 
-      # 4. スクレイピングスクリプトの実行
       - name: Run scraper script
         run: python kakuyomu_harem_scraper.py
 
-      # 5. 生成されたCSVファイルをアーティファクトとしてアップロード
-      # これにより、実行完了後に画面からCSVをダウンロードできます
+      # 重要な変更点: if: always() を追加
+      # これにより、上のスクリプトがタイムアウトで強制終了しても、
+      # 生成済みのCSVファイルは必ずアップロードされます。
       - name: Upload CSV artifact
+        if: always() 
         uses: actions/upload-artifact@v4
         with:
           name: kakuyomu-search-results
