@@ -27,6 +27,7 @@ MAX_EPISODE_PAGES = 50
 TIMEOUT = 15
 
 OUTPUT_FILENAME = "kakuyomu_harem_filtered.csv"
+CSV_FIELDNAMES = ['title', 'url', 'stars', 'total_chars', 'first_episode_date', 'tags', 'notice_sexual']
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 (KADOKAWA_Internal_Tool_Test/GitHubActions)"
@@ -52,7 +53,7 @@ def create_session():
 # ヘルパー関数
 # ==========================================
 def fetch_soup(session, url):
-    print(f"Fetch: {url}")
+    # print(f"Fetch: {url}") # ログ過多を防ぐためコメントアウト
     try:
         time.sleep(SLEEP_TIME)
         response = session.get(url, timeout=TIMEOUT)
@@ -76,38 +77,34 @@ def get_iso_date(text):
     except (ValueError, TypeError):
         return None
 
+# CSVへの追記用関数
+def append_to_csv(data_dict):
+    try:
+        with open(OUTPUT_FILENAME, 'a', encoding='utf-8-sig', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+            writer.writerow(data_dict)
+    except IOError as e:
+        print(f"Error writing to CSV: {e}", file=sys.stderr)
+
 # ==========================================
 # スクレイピングロジック
 # ==========================================
 
 def get_work_listing_info(soup):
-    """
-    一覧ページから作品情報の候補を抽出する（クラス名に依存しないロバストな実装）
-    戻り値: {url: {stars: int, chars: int}} の辞書
-    """
     works_map = {}
-    
-    # メインコンテンツエリアを特定（サイドバーのリンクを拾わないようにするため）
     main_area = soup.select_one('main, div[role="main"], .widget-mainColumn, #main')
-    if not main_area:
-        main_area = soup # 見つからなければ全体から探す
+    if not main_area: main_area = soup
 
-    # hrefが "/works/数字" で終わるリンクを全て取得
     links = main_area.find_all('a', href=re.compile(r'^/works/\d+$'))
     
     for link in links:
         href = link.get('href')
         url = urljoin(BASE_URL, href)
-        
-        # 重複チェック（既に処理済みならスキップ）
-        if url in works_map:
-            continue
+        if url in works_map: continue
 
-        # リンクの親要素を辿って、作品情報のコンテナ（カード）と思われる要素を探す
-        # "文字" というテキストが含まれている最も近い親要素（div, article, li）を探す
         container = None
         curr = link.parent
-        for _ in range(4): # 4階層まで遡る
+        for _ in range(4):
             if not curr: break
             if curr.name in ['div', 'article', 'li'] and "文字" in curr.get_text():
                 container = curr
@@ -115,31 +112,21 @@ def get_work_listing_info(soup):
             curr = curr.parent
         
         if not container:
-            # コンテナが見つからない場合は、リンク周辺の情報が取れないのでスキップまたはデフォルト値
-            # ここでは安全のため、詳細ページ取得対象候補として登録（数値0）
             works_map[url] = {'stars': 0, 'chars': 0}
             continue
 
         text_content = container.get_text()
-
-        # 星数を正規表現で探す (例: ★1,234 / ☆ 1234 / 1234)
-        # "★"や"☆"の近くにある数字、または ReviewPoints などのクラスを持つ要素
         stars = 0
-        # パターン1: クラス名指定での取得試行
         star_elm = container.select_one('[class*="ReviewPoints"], [class*="Star-module__count"], .js-stars-count')
         if star_elm:
             stars = parse_int(star_elm.get_text())
         else:
-            # パターン2: テキスト解析 (★ 1,234)
             star_match = re.search(r'[★☆]\s*([\d,]+)', text_content)
-            if star_match:
-                stars = parse_int(star_match.group(1))
+            if star_match: stars = parse_int(star_match.group(1))
 
-        # 文字数を正規表現で探す (例: 12,345文字)
         chars = 0
         char_match = re.search(r'([\d,]+)文字', text_content)
-        if char_match:
-            chars = parse_int(char_match.group(1))
+        if char_match: chars = parse_int(char_match.group(1))
 
         works_map[url] = {'stars': stars, 'chars': chars}
 
@@ -149,11 +136,9 @@ def process_work_details(session, work_url, listing_stars, listing_chars):
     soup = fetch_soup(session, work_url)
     if not soup: return None
 
-    # タイトル
     title_tag = soup.select_one('h1#workTitle, h1') 
     title = title_tag.get_text(strip=True) if title_tag else "No Title"
 
-    # 星数・文字数（詳細ページで再取得を試みる）
     stars = listing_stars
     points_elm = soup.select_one('#workPoints, .js-stars-count')
     if points_elm: stars = parse_int(points_elm.get_text())
@@ -162,36 +147,26 @@ def process_work_details(session, work_url, listing_stars, listing_chars):
     chars_elm = soup.select_one('#workTotalCharacterCount')
     if chars_elm: total_chars = parse_int(chars_elm.get_text())
 
-    # フィルタ
-    if stars < MIN_STARS or total_chars < MIN_CHARS:
-        return None
+    if stars < MIN_STARS or total_chars < MIN_CHARS: return None
 
-    # タグ
     tags = []
     tag_links = soup.select('[itemprop="keywords"] a, #tagList a, [class*="TagList"] a')
-    for link in tag_links:
-        tags.append(link.get_text(strip=True))
+    for link in tag_links: tags.append(link.get_text(strip=True))
     
-    if TARGET_TAG_SEARCH not in tags:
-        return None
+    if TARGET_TAG_SEARCH not in tags: return None
 
-    # 性描写ありチェック
     notice_sexual = False
     notice_elms = soup.select('#workHeader-inner, .work-header-notice, [class*="Notice"], [aria-label="性描写あり"]')
     full_text = " ".join([e.get_text() for e in notice_elms]) + " " + " ".join([e.get('aria-label', '') for e in soup.select('[aria-label]')])
     
-    if "性描写あり" in full_text:
-        notice_sexual = True
+    if "性描写あり" in full_text: notice_sexual = True
 
-    if not notice_sexual:
-        return None
+    if not notice_sexual: return None
 
-    # 初回エピソード日時
     first_date = get_first_episode_date(session, work_url)
     if not first_date: return None
     
-    if first_date < TARGET_START_DATE:
-        return None
+    if first_date < TARGET_START_DATE: return None
 
     return {
         'title': title,
@@ -244,64 +219,59 @@ def get_first_episode_date(session, work_url):
 # ==========================================
 def main():
     session = create_session()
-    results = []
     total_scanned = 0
+    match_count = 0
     
     print(f"Start scraping: {SEARCH_URL}")
     
-    for page in range(1, MAX_LISTING_PAGES + 1):
-        target_url = f"{SEARCH_URL}?sort=popular&page={page}"
-        soup = fetch_soup(session, target_url)
-        if not soup: break
+    # 1. 開始時にCSVファイルを初期化（ヘッダー書き込み）
+    # これにより、結果が0件でも空のCSVが生成される
+    with open(OUTPUT_FILENAME, 'w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+    
+    try:
+        for page in range(1, MAX_LISTING_PAGES + 1):
+            target_url = f"{SEARCH_URL}?sort=popular&page={page}"
+            soup = fetch_soup(session, target_url)
+            if not soup: break
 
-        # ページタイトル確認
-        page_title = soup.title.get_text(strip=True) if soup.title else "No Title"
-        print(f"Page {page} Title: {page_title}")
+            page_title = soup.title.get_text(strip=True) if soup.title else "No Title"
+            print(f"Page {page} Title: {page_title}")
 
-        # 新しいロジックで作品リストを取得
-        works_info_map = get_work_listing_info(soup)
-        
-        if not works_info_map:
-            print(f"No works found on page {page}. (Link detection failed)")
-            break
-
-        print(f"Processing page {page} ({len(works_info_map)} works found)...")
-
-        for work_url, info in works_info_map.items():
-            total_scanned += 1
+            works_info_map = get_work_listing_info(soup)
             
-            # 一覧での簡易フィルタ
-            # 数値が取得できていない(0)場合は、念のため詳細ページを見に行く（取りこぼし防止）
-            # 数値が明確に取得できていて、かつ基準未満ならスキップ
-            if info['stars'] > 0 and info['stars'] < (MIN_STARS * 0.8):
-                continue
-            if info['chars'] > 0 and info['chars'] < (MIN_CHARS * 0.8):
-                continue
-            
-            print(f"Checking: {work_url} (Est. Stars: {info['stars']}, Chars: {info['chars']})")
-            
-            try:
-                work_data = process_work_details(session, work_url, info['stars'], info['chars'])
-                if work_data:
-                    print(f"  [MATCH] Found: {work_data['title']}")
-                    results.append(work_data)
-            except Exception as e:
-                print(f"Error processing {work_url}: {e}")
-                continue
+            if not works_info_map:
+                print(f"No works found on page {page}. (Link detection failed)")
+                break
 
-    if results:
-        print(f"\nWriting {len(results)} works to {OUTPUT_FILENAME}...")
-        with open(OUTPUT_FILENAME, 'w', encoding='utf-8-sig', newline='') as f:
-            fieldnames = ['title', 'url', 'stars', 'total_chars', 'first_episode_date', 'tags', 'notice_sexual']
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(results)
-    else:
-        print("\nNo works matched the criteria (Outputting empty file).")
-        with open(OUTPUT_FILENAME, 'w', encoding='utf-8-sig', newline='') as f:
-            pass
+            print(f"Processing page {page} ({len(works_info_map)} works found)...")
 
-    print(f"Done. Total listing scanned: {total_scanned}")
+            for work_url, info in works_info_map.items():
+                total_scanned += 1
+                
+                if info['stars'] > 0 and info['stars'] < (MIN_STARS * 0.8): continue
+                if info['chars'] > 0 and info['chars'] < (MIN_CHARS * 0.8): continue
+                
+                print(f"Checking: {work_url} (Est. Stars: {info['stars']}, Chars: {info['chars']})")
+                
+                try:
+                    work_data = process_work_details(session, work_url, info['stars'], info['chars'])
+                    if work_data:
+                        print(f"  [MATCH] Found: {work_data['title']}")
+                        # 2. 見つかった瞬間にCSVに追記保存
+                        append_to_csv(work_data)
+                        match_count += 1
+                except Exception as e:
+                    print(f"Error processing {work_url}: {e}")
+                    continue
+                    
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user (or timeout). Saving progress...")
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+    finally:
+        print(f"\nDone. Scanned: {total_scanned}, Matches: {match_count} (saved to {OUTPUT_FILENAME})")
 
 if __name__ == "__main__":
     main()
